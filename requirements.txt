@@ -1,0 +1,11 @@
+crawl4ai
+beautifulsoup4
+httpx
+pymupdf
+langchain-text-splitters
+langchain-ollama
+chromadb
+rank-bm25
+sentence-transformers
+neo4j
+chainlit

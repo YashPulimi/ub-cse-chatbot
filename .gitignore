@@ -1,0 +1,14 @@
+venv/
+env/
+rag_new/
+myenv*/
+.venv/
+data/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.chainlit/
+chainlit.db
+.DS_Store
+*.log
