@@ -5,7 +5,9 @@ Pipeline:
   1. Hybrid retrieval     — BM25 + dense + RRF fusion
   2. Cross-encoder rerank — ms-marco-MiniLM-L-6-v2
   3. Neo4j KG lookup      — structured facts for faculty/course queries
-  4. Local LLM generation — Ollama (conversational, warm tone)
+  4. Local LLM generation — Ollama (con'
+  
+  versational, warm tone)
   5. Sliding window memory— last 5 turns
   6. Guardrails           — blocks off-topic queries
   7. Chainlit UI          — streaming, source citations
@@ -39,7 +41,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 CHROMA_DIR     = Path("data/chroma")
 COLLECTION     = "ub_cse"
 EMBED_MODEL    = "nomic-embed-text"
-LLM_MODEL      = "qwen2.5:3b"
+# LLM_MODEL      = "qwen2.5:3b"
+LLM_MODEL = "llama3.2:3b"
 NEO4J_URI      = "bolt://localhost:7687"
 NEO4J_USER     = "neo4j"
 NEO4J_PASSWORD = "password123"
@@ -383,7 +386,7 @@ async def on_message(message: cl.Message):
     kg = get_kg()
     kg_facts = await loop.run_in_executor(None, kg.get_facts, query)
 
-    async with cl.Step(name="🔍 Searching knowledge base...") as step:
+    async with cl.Step(name="Searching knowledge base...") as step:
         chunks = await loop.run_in_executor(None, get_retriever().search, query)
         step.output = "\n".join(
             f"{c.get('page_type', '?')} | rerank={c.get('rerank_score', '?')}"
@@ -398,7 +401,7 @@ async def on_message(message: cl.Message):
     if kg_facts:
         elements.append(
             cl.Text(
-                name="📊 Knowledge Graph",
+                name=" Knowledge Graph",
                 content=f"**Facts:**\n{kg_facts}",
                 display="inline"
             )
