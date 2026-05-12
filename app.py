@@ -1,426 +1,250 @@
 """
-app.py — UB CSE Conversational Chatbot
-========================================
-Pipeline:
-  1. Hybrid retrieval     — BM25 + dense + RRF fusion
-  2. Cross-encoder rerank — ms-marco-MiniLM-L-6-v2
-  3. Neo4j KG lookup      — structured facts for faculty/course queries
-  4. Local LLM generation — Ollama (con'
-  
-  versational, warm tone)
-  5. Sliding window memory— last 5 turns
-  6. Guardrails           — blocks off-topic queries
-  7. Chainlit UI          — streaming, source citations
-
-HOW TO RUN:
-  chainlit run app.py
+app.py — UB CSE Chatbot
+========================
+UB brand: #005bbb blue, white, Montserrat headers — matches engineering.buffalo.edu
+Run:  python -m chainlit run app.py
 """
 
-import asyncio
-import logging
-import re
-import sys
-from collections import defaultdict
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent))
+from __future__ import annotations
+import time
+import uuid
 
 import chainlit as cl
-import chromadb
-from chromadb.config import Settings
-from langchain_ollama import OllamaEmbeddings, OllamaLLM
-from neo4j import GraphDatabase
-from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder
 
-log = logging.getLogger("app")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+from config import cfg
+from generator import get_generator
+from guardrails import get_guardrails
+from memory import get_memory, clear_memory
+from reranker import get_reranker, Reranker
+from retriever import get_retriever
+from utils import get_logger
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
-CHROMA_DIR     = Path("data/chroma")
-COLLECTION     = "ub_cse"
-EMBED_MODEL    = "nomic-embed-text"
-# LLM_MODEL      = "qwen2.5:3b"
-LLM_MODEL = "llama3.2:3b"
-NEO4J_URI      = "bolt://localhost:7687"
-NEO4J_USER     = "neo4j"
-NEO4J_PASSWORD = "password123"
-RERANK_MODEL   = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-MEMORY_K       = 5
-TOP_K          = 20
-FINAL_TOP_N    = 5
-
-# ── BM25 ──────────────────────────────────────────────────────────────────────
-
-class BM25Index:
-    def __init__(self):
-        self.ids = []
-        self.index = None
-
-    def build(self, chunks: list[dict]):
-        tokenize = lambda t: re.sub(r"[^\w\s]", " ", t.lower()).split()
-        self.ids = [c["id"] for c in chunks]
-        self.index = BM25Okapi([tokenize(c["text"]) for c in chunks])
-
-    def search(self, query: str, top_k=10) -> list[tuple[str, float]]:
-        tokens = re.sub(r"[^\w\s]", " ", query.lower()).split()
-        scores = self.index.get_scores(tokens)
-        ranked = sorted(zip(self.ids, scores), key=lambda x: x[1], reverse=True)
-        return [(cid, float(s)) for cid, s in ranked[:top_k] if s > 0]
+log = get_logger(__name__)
 
 
-# ── Hybrid Retriever ──────────────────────────────────────────────────────────
-
-class HybridRetriever:
-    """BM25 + dense search + RRF + cross-encoder reranking."""
-
-    def __init__(self):
-        self.client = chromadb.PersistentClient(
-            path=str(CHROMA_DIR),
-            settings=Settings(anonymized_telemetry=False),
-        )
-        self.collection = self.client.get_collection(COLLECTION)
-        self.embedder = OllamaEmbeddings(model=EMBED_MODEL)
-
-        all_chunks = self._load_chunks()
-        self.bm25 = BM25Index()
-        self.bm25.build(all_chunks)
-        self.chunk_map = {c["id"]: c for c in all_chunks}
-        self.reranker = CrossEncoder(RERANK_MODEL, max_length=512)
-
-        log.info(f"Retriever ready — {self.collection.count()} chunks")
-
-    def _load_chunks(self) -> list[dict]:
-        r = self.collection.get(include=["documents", "metadatas"])
-        return [
-            {"id": cid, "text": doc, **meta}
-            for cid, doc, meta in zip(r["ids"], r["documents"], r["metadatas"])
-        ]
-
-    def search(self, query: str, top_n=FINAL_TOP_N) -> list[dict]:
-        vec = self.embedder.embed_query(query)
-        dense = self.collection.query(
-            query_embeddings=[vec], n_results=TOP_K, include=["distances"]
-        )
-        dense_hits = list(zip(dense["ids"][0], dense["distances"][0]))
-
-        bm25_hits = self.bm25.search(query, top_k=TOP_K)
-
-        scores: dict = defaultdict(float)
-        for rank, (cid, _) in enumerate(dense_hits, 1):
-            scores[cid] += 0.6 / (60 + rank)
-        for rank, (cid, _) in enumerate(bm25_hits, 1):
-            scores[cid] += 0.4 / (60 + rank)
-        fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-        candidates = [
-            {**self.chunk_map[cid], "rrf_score": round(score, 5)}
-            for cid, score in fused[:TOP_K]
-            if cid in self.chunk_map
-        ]
-
-        if candidates:
-            pairs = [(query, c["text"]) for c in candidates]
-            rscores = self.reranker.predict(pairs)
-            ranked = sorted(zip(candidates, rscores), key=lambda x: x[1], reverse=True)
-            for chunk, score in ranked:
-                chunk["rerank_score"] = round(float(score), 4)
-            candidates = [c for c, _ in ranked[:top_n]]
-
-        return candidates
-
-
-# ── Knowledge Graph ───────────────────────────────────────────────────────────
-
-class KnowledgeGraph:
-    """Query Neo4j for structured facts to augment LLM context."""
-
-    def __init__(self):
-        try:
-            self.driver = GraphDatabase.driver(
-                NEO4J_URI,
-                auth=(NEO4J_USER, NEO4J_PASSWORD)
-            )
-            self.driver.verify_connectivity()
-            self.available = True
-            log.info("Neo4j connected")
-        except Exception as e:
-            log.warning(f"Neo4j unavailable: {e}")
-            self.available = False
-
-    def _run(self, cypher: str, **params) -> list[dict]:
-        if not self.available:
-            return []
-        try:
-            with self.driver.session() as s:
-                return [dict(r) for r in s.run(cypher, **params)]
-        except Exception:
-            return []
-
-    def get_facts(self, query: str) -> str:
-        facts = []
-        q = query.lower()
-
-        for num in re.findall(r"cse\s*(\d{3}[a-z]?)", q, re.IGNORECASE):
-            code = f"CSE {num.upper()}"
-
-            rows = self._run("""
-                MATCH (p:Professor)-[:TEACHES]->(c:Course {code:$code})
-                RETURN p.name AS name, p.email AS email, p.office AS office, c.title AS title
-            """, code=code)
-            for r in rows:
-                facts.append(
-                    f"{r['name']} teaches {code} ({r.get('title', '')})."
-                    + (f" Email: {r['email']}." if r.get("email") else "")
-                    + (f" Office: {r['office']}." if r.get("office") else "")
-                )
-
-            rows = self._run("""
-                MATCH (pre:Course)-[:PREREQ_FOR]->(c:Course {code:$code})
-                RETURN pre.code AS code, pre.title AS title
-            """, code=code)
-            for r in rows:
-                facts.append(f"Prerequisite for {code}: {r['code']} {r.get('title', '')}")
-
-        for pattern in [
-            r"professor\s+(\w+)",
-            r"dr\.?\s+(\w+)",
-            r"(\w+)'s\s+(?:office|email|course)"
-        ]:
-            m = re.search(pattern, q)
-            if m:
-                rows = self._run("""
-                    MATCH (p:Professor)
-                    WHERE toLower(p.name) CONTAINS $name
-                    OPTIONAL MATCH (p)-[:TEACHES]->(c:Course)
-                    RETURN p.name AS name, p.email AS email,
-                           p.office AS office, p.rank AS rank,
-                           collect(c.code) AS courses
-                    LIMIT 3
-                """, name=m.group(1).lower())
-                for r in rows:
-                    facts.append(
-                        f"{r['name']} ({r.get('rank', 'Professor')}). "
-                        f"Email: {r.get('email', 'N/A')}. "
-                        f"Office: {r.get('office', 'N/A')}. "
-                        f"Courses: {', '.join(r['courses']) if r['courses'] else 'N/A'}."
-                    )
-
-        area_m = re.search(
-            r"(machine learning|deep learning|computer vision|nlp|"
-            r"natural language|security|database|network|algorithm|ai\b)",
-            q,
-            re.IGNORECASE
-        )
-        if area_m and any(kw in q for kw in ["who", "research", "professor", "faculty", "work"]):
-            rows = self._run("""
-                MATCH (p:Professor)-[:WORKS_IN]->(r:ResearchArea)
-                WHERE toLower(r.name) CONTAINS $area
-                RETURN p.name AS name LIMIT 8
-            """, area=area_m.group(1).lower())
-            if rows:
-                names = [r["name"] for r in rows]
-                facts.append(f"Faculty working on {area_m.group(1)}: {', '.join(names)}.")
-
-        return "\n".join(facts)
-
-
-# ── Guardrail ─────────────────────────────────────────────────────────────────
-
-class Guardrail:
-    CSE_KEYWORDS = {
-        "cse", "course", "class", "program", "degree", "professor",
-        "faculty", "research", "lab", "graduate", "undergraduate",
-        "admission", "deadline", "credit", "gpa", "phd", "ms", "master",
-        "thesis", "capstone", "syllabus", "prerequisite", "requirement",
-        "buffalo", "ub", "engineering", "computer science", "algorithm",
-        "machine learning", "ai", "security", "davis hall", "capen hall",
-    }
-    HARMFUL = [
-        r"ignore.{0,20}instruction", r"jailbreak",
-        r"forget.{0,20}instruction", r"ignore previous",
-    ]
-    OUT_OF_SCOPE = [
-        r"\bpizza\b", r"\bweather\b", r"\bsports\b",
-        r"\bpolitics\b", r"\bjoke\b",
+@cl.set_starters
+async def set_starters():
+    return [
+        cl.Starter(label="Who teaches computer vision?",
+                   message="Who teaches computer vision at UB CSE?", icon="👁️"),
+        cl.Starter(label="MS degree requirements",
+                   message="What are the MS CSE degree requirements?", icon="🎓"),
+        cl.Starter(label="CSE 574 prerequisites",
+                   message="What are the prerequisites for CSE 574?", icon="📚"),
+        cl.Starter(label="PhD admissions GPA",
+                   message="What GPA is required for the CSE PhD program?", icon="🔬"),
     ]
 
-    def check(self, query: str) -> str:
-        q = query.lower()
-        for p in self.HARMFUL:
-            if re.search(p, q):
-                return "HARMFUL"
-        for p in self.OUT_OF_SCOPE:
-            if re.search(p, q):
-                return "OUT_SCOPE"
-        if any(kw in q for kw in self.CSE_KEYWORDS):
-            return "IN_SCOPE"
-        if len(query.split()) <= 5:
-            return "IN_SCOPE"
-        return "IN_SCOPE"
-
-
-# ── Generator ─────────────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are a warm, helpful assistant for UB's Computer Science
-and Engineering department. You're like a knowledgeable friend — approachable,
-positive, and genuinely excited to help students navigate UB CSE.
-
-Guidelines:
-- Be conversational and encouraging, not robotic
-- Answer only from the provided context and knowledge graph facts
-- If you don't have the info, say so warmly and point to the official site
-- Keep answers clear and concise
-- For deadlines and requirements, remind students to verify on the official site
-- Knowledge graph facts are highly reliable — prioritize them for faculty/course info"""
-
-
-class Generator:
-    def __init__(self):
-        self.llm = OllamaLLM(model=LLM_MODEL, temperature=0.3)
-        self.history: list[dict] = []
-
-    def generate(self, query: str, chunks: list[dict], kg_facts: str) -> str:
-        context = "\n\n---\n\n".join(
-            f"[{i}] {c.get('title', '')}\n{c['text']}"
-            for i, c in enumerate(chunks, 1)
-        )
-        history = "".join(
-            f"{'Student' if t['role'] == 'user' else 'Assistant'}: {t['content']}\n"
-            for t in self.history[-(MEMORY_K * 2):]
-        )
-
-        conv_part = f"Conversation so far:\n{history}\n" if history else ""
-        kg_part = f"Knowledge Graph Facts (reliable):\n{kg_facts}\n\n" if kg_facts else ""
-
-        prompt = (
-            f"{SYSTEM_PROMPT}\n\n"
-            f"{conv_part}"
-            f"{kg_part}"
-            f"Context:\n{context}\n\n"
-            f"Student: {query}\n"
-            f"Assistant:"
-        )
-
-        answer = self.llm.invoke(prompt).strip()
-        self.history.append({"role": "user", "content": query})
-        self.history.append({"role": "assistant", "content": answer})
-        return answer
-
-    def reset(self):
-        self.history = []
-
-
-# ── Globals ───────────────────────────────────────────────────────────────────
-
-_retriever: HybridRetriever | None = None
-_generator: Generator | None = None
-_kg: KnowledgeGraph | None = None
-_guardrail = Guardrail()
-
-
-def get_retriever():
-    global _retriever
-    if not _retriever:
-        _retriever = HybridRetriever()
-    return _retriever
-
-
-def get_generator():
-    global _generator
-    if not _generator:
-        _generator = Generator()
-    return _generator
-
-
-def get_kg():
-    global _kg
-    if not _kg:
-        _kg = KnowledgeGraph()
-    return _kg
-
-
-# ── Chainlit UI ───────────────────────────────────────────────────────────────
 
 @cl.on_chat_start
 async def on_chat_start():
-    await cl.Message(content="⏳ Starting up...").send()
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, get_retriever)
-    await loop.run_in_executor(None, get_generator)
-    await loop.run_in_executor(None, get_kg)
-    get_generator().reset()
+    session_id = str(uuid.uuid4())
+    cl.user_session.set("session_id", session_id)
+    cl.user_session.set("message_count", 0)
 
-    await cl.Message(content=(
-        "👋 Hey! I'm your **UB CSE Assistant** — here to help you navigate "
-        "everything about the CS & Engineering department at Buffalo!\n\n"
-        "I can help with:\n"
-        "- 📚 MS, PhD, and undergraduate programs\n"
-        "- 📅 Admissions deadlines and requirements\n"
-        "- 👨‍🏫 Faculty info, office hours, and research\n"
-        "- 📖 Courses, prerequisites, and credit requirements\n\n"
-        "What can I help you with today? 😊"
-    )).send()
+    try:
+        get_retriever(); get_reranker(); get_guardrails(); get_generator()
+    except Exception as e:
+        log.warning("Pre-warm failed: %s", e)
 
-
-@cl.on_message
-async def on_message(message: cl.Message):
-    query = message.content.strip()
-    label = _guardrail.check(query)
-
-    if label == "HARMFUL":
-        await cl.Message(
-            content="That's not something I can help with! Ask me anything about UB CSE instead 😊"
-        ).send()
-        return
-
-    if label == "OUT_SCOPE":
-        await cl.Message(
-            content="Ha, I wish I could help with that! I'm strictly a UB CSE expert — ask me about courses, faculty, or programs!"
-        ).send()
-        return
-
-    loop = asyncio.get_event_loop()
-
-    kg = get_kg()
-    kg_facts = await loop.run_in_executor(None, kg.get_facts, query)
-
-    async with cl.Step(name="Searching knowledge base...") as step:
-        chunks = await loop.run_in_executor(None, get_retriever().search, query)
-        step.output = "\n".join(
-            f"{c.get('page_type', '?')} | rerank={c.get('rerank_score', '?')}"
-            for c in chunks[:3]
-        )
-
-    answer = await loop.run_in_executor(
-        None, get_generator().generate, query, chunks, kg_facts
-    )
-
-    elements = []
-    if kg_facts:
-        elements.append(
-            cl.Text(
-                name=" Knowledge Graph",
-                content=f"**Facts:**\n{kg_facts}",
-                display="inline"
-            )
-        )
-
-    sources = list({c.get("url", "") for c in chunks if c.get("url")})[:3]
-    if sources:
-        elements.append(
-            cl.Text(
-                name="🔗 Sources",
-                content="**Sources:**\n" + "\n".join(f"- [{u}]({u})" for u in sources),
-                display="inline",
-            )
-        )
-
-    await cl.Message(content=answer, elements=elements).send()
+    await cl.Message(
+        content=_welcome(),
+        author="UB CSE Assistant",
+    ).send()
 
 
 @cl.on_chat_end
 async def on_chat_end():
-    if _generator:
-        _generator.reset()
+    sid = cl.user_session.get("session_id", "")
+    if sid:
+        clear_memory(sid)
+
+
+def _welcome() -> str:
+    return (
+        "---\n"
+        "### 🎓 Department of Computer Science and Engineering\n"
+        "**University at Buffalo** — School of Engineering and Applied Sciences\n\n"
+        "---\n\n"
+        "Ask me anything about UB CSE:\n\n"
+        "- **Courses** — prerequisites, credits, descriptions\n"
+        "- **Faculty** — office hours, research areas, contact info\n"
+        "- **Programs** — MS, PhD, BS requirements and specializations\n"
+        "- **Research** — labs, research areas, faculty interests\n"
+        "- **Admissions** — GPA requirements, deadlines, required documents\n\n"
+        f"*Model: `{cfg.llm.model}`*"
+    )
+
+
+@cl.on_message
+async def on_message(message: cl.Message):
+    session_id = cl.user_session.get("session_id", str(uuid.uuid4()))
+    mem        = get_memory(session_id)
+    t_start    = time.perf_counter()
+
+    count = cl.user_session.get("message_count", 0) + 1
+    cl.user_session.set("message_count", count)
+
+    query = message.content.strip()
+    if not query:
+        return
+
+    await _pipeline(query, mem, session_id, t_start)
+
+
+async def _pipeline(query, mem, session_id, t_start):
+    # ── Personalization ───────────────────────────────────────────────────────
+    resolved = mem.process_user_turn(query)
+    if resolved == "__PERSONALIZE_YES__":
+        mem.add_assistant_turn("Personalization on.")
+        await cl.Message(
+            content="Great! Tell me your program (MS/PhD/BS) and interests.",
+            author="UB CSE Assistant").send()
+        return
+    if resolved == "__PERSONALIZE_NO__":
+        mem.add_assistant_turn("Continuing without personalization.")
+        await cl.Message(
+            content="No problem! Ask me anything about UB CSE.",
+            author="UB CSE Assistant").send()
+        return
+
+    # ── Guardrails ────────────────────────────────────────────────────────────
+    decision = await get_guardrails().check(resolved)
+    if decision.small_talk:
+        mem.add_assistant_turn(decision.canned_reply)
+        await cl.Message(content=decision.canned_reply, author="UB CSE Assistant").send()
+        return
+    if not decision.allowed:
+        mem.add_assistant_turn(decision.redirect_msg)
+        await cl.Message(content=decision.redirect_msg, author="UB CSE Assistant").send()
+        return
+
+    # ── Retrieval ─────────────────────────────────────────────────────────────
+    try:
+        candidates, timings = await get_retriever().retrieve_with_latency(resolved)
+    except Exception as e:
+        log.error("Retrieval error: %s", e, exc_info=True)
+        candidates, timings = [], {}
+
+    # ── Reranking ─────────────────────────────────────────────────────────────
+    t_rr = time.perf_counter()
+    try:
+        ranked = await get_reranker().rerank(resolved, candidates)
+    except Exception as e:
+        log.error("Rerank error: %s", e, exc_info=True)
+        ranked = candidates[:cfg.reranker.top_k]
+    rerank_ms     = round((time.perf_counter() - t_rr) * 1000, 1)
+    score_summary = Reranker.score_summary(ranked)
+
+    # ── Side panels ───────────────────────────────────────────────────────────
+    elements = _build_elements(ranked, score_summary, timings, rerank_ms, decision)
+
+    # ── Stream answer ─────────────────────────────────────────────────────────
+    history = mem.build_prompt_context()
+    msg     = cl.Message(content="", author="UB CSE Assistant", elements=elements)
+    await msg.send()
+
+    full_resp = []
+    ttft_ms   = None
+    t_gen     = time.perf_counter()
+
+    async for token in get_generator().stream(resolved, ranked, history):
+        if ttft_ms is None:
+            ttft_ms = round((time.perf_counter() - t_gen) * 1000, 1)
+        await msg.stream_token(token)
+        full_resp.append(token)
+
+    total_ms = round((time.perf_counter() - t_start) * 1000, 1)
+    await msg.stream_token(_latency_footer(ttft_ms or 0, total_ms, rerank_ms))
+    await msg.update()
+
+    mem.add_assistant_turn("".join(full_resp))
+    log.info("Done: %.0f ms | %s", total_ms, session_id)
+
+    if mem.should_ask_personalize():
+        await cl.Message(
+            content=mem.get_personalize_prompt(),
+            author="UB CSE Assistant").send()
+
+
+def _build_elements(ranked, score_summary, timings, rerank_ms, decision):
+    elements = []
+    text_chunks  = [r for r in ranked if r.get("source") != "graph"]
+    graph_chunks = [r for r in ranked if r.get("source") == "graph"]
+
+    # ── Top chunks ────────────────────────────────────────────────────────────
+    if text_chunks:
+        lines = []
+        for i, r in enumerate(text_chunks[:5], 1):
+            meta   = r.get("metadata", {})
+            url    = meta.get("url", "")
+            ptype  = meta.get("page_type", "?")
+            ce     = r.get("ce_score", "—")
+            rrf    = r.get("rrf_score", r.get("score", 0))
+            ce_str = f"{ce:.4f}" if isinstance(ce, float) else str(ce)
+            text   = (r.get("text") or "").strip()
+
+            lines.append(f"{'━'*58}")
+            lines.append(f"Chunk {i}  ·  {ptype}  ·  CE={ce_str}  ·  RRF={rrf:.5f}")
+            if url:
+                lines.append(f"Source: {url}")
+            lines.append("")
+            lines.append(text[:800] + ("…" if len(text) > 800 else ""))
+            lines.append("")
+
+        elements.append(cl.Text(
+            name="📄 Top Retrieved Chunks",
+            content="\n".join(lines),
+            display="side",
+        ))
+
+    # ── Graph evidence ────────────────────────────────────────────────────────
+    if graph_chunks:
+        elements.append(cl.Text(
+            name="🕸️ Graph Evidence",
+            content="\n\n".join(r.get("text", "") for r in graph_chunks),
+            display="side",
+        ))
+
+    # ── Reranking + latency ───────────────────────────────────────────────────
+    table = [
+        "RERANKING SCORES",
+        "─" * 62,
+        f"  {'#':>2}  {'src':>6}  {'CE':>8}  {'RRF':>10}  "
+        f"{'d#':>4}  {'b#':>4}  page_type",
+        "  " + "─" * 56,
+    ]
+    for s in score_summary:
+        ce  = f"{s['ce_score']:.4f}" if isinstance(s["ce_score"], float) else "   graph"
+        rrf = f"{s['rrf_score']:.5f}"
+        table.append(
+            f"  {s['rank']:>2}  {s['source']:>6}  {ce:>8}  {rrf:>10}  "
+            f"{str(s['dense_rank']):>4}  {str(s['bm25_rank']):>4}  {s['page_type'][:20]}"
+        )
+    table += [
+        "",
+        "LATENCY BREAKDOWN",
+        "─" * 40,
+        f"  Dense  : {timings.get('dense_ms',  0):.0f} ms  ({timings.get('n_dense', 0)} hits)",
+        f"  BM25   : {timings.get('bm25_ms',   0):.0f} ms  ({timings.get('n_bm25',  0)} hits)",
+        f"  Graph  : {timings.get('graph_ms',  0):.0f} ms  ({timings.get('n_graph', 0)} hits)",
+        f"  Fusion : {timings.get('fusion_ms', 0):.0f} ms  → {timings.get('n_fused', 0)} fused",
+        f"  Rerank : {rerank_ms:.0f} ms",
+        f"  Guard  : {decision.latency_ms:.0f} ms  [{decision.reason}]",
+    ]
+    elements.append(cl.Text(
+        name="📊 Reranking & Latency",
+        content="\n".join(table),
+        display="side",
+    ))
+
+    return elements
+
+
+def _latency_footer(ttft_ms: float, total_ms: float, rerank_ms: float) -> str:
+    return (
+        f"\n\n---\n"
+        f"⏱ **TTFT** {ttft_ms:.0f} ms  ·  "
+        f"**Total** {total_ms:.0f} ms  ·  "
+        f"**Rerank** {rerank_ms:.0f} ms"
+    )

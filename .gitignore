@@ -1,39 +1,30 @@
-# -------------------
-# Virtual environments
-# -------------------
 .venv/
 venv/
-env/
-
-# -------------------
-# Python cache
-# -------------------
 __pycache__/
 *.pyc
-
-# -------------------
-# System
-# -------------------
+.env
+.env.*
+!.env.example
 .DS_Store
-
-# -------------------
-# Runtime / DB
-# -------------------
-chroma_db/
-data/chroma/
-
-# -------------------
-# Raw scraped data (rebuildable)
-# -------------------
-data/raw/
-
-# -------------------
-# Chainlit
-# -------------------
-.chainlit/
-chainlit.db
-
-# -------------------
-# Logs
-# -------------------
+logs/
 *.log
+data/raw/
+data/processed/
+data/indexes/
+data/eval/eval_results.json
+data/eval/eval_summary.json
+*.pkl
+*.gpickle
+qdrant_db/
+data/indexes/qdrant_db/
+.cache/
+
+# secrets
+.env
+.env.*
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

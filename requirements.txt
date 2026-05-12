@@ -1,11 +1,62 @@
-crawl4ai
-beautifulsoup4
-httpx
-pymupdf
-langchain-text-splitters
-langchain-ollama
-chromadb
-rank-bm25
-sentence-transformers
-neo4j
-chainlit
+# requirements_deploy.txt — UB CSE RAG + GraphRAG Chatbot (VM deployment)
+# crawl4ai and chainlit removed due to aiofiles version conflict
+
+# ── Core async + HTTP ───────────────────────────────────────
+httpx>=0.27.0,<1.0.0
+aiohttp>=3.10.0,<4.0.0
+nest-asyncio>=1.6.0
+
+# ── Web framework ───────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.25.0
+
+# ── Web crawling ────────────────────────────────────────────
+beautifulsoup4>=4.12.0
+lxml>=5.2.0
+
+# ── Config ─────────────────────────────────────────────────
+python-dotenv>=1.0.0
+PyYAML>=6.0.1
+
+# ── LlamaIndex core + integrations ─────────────────────────
+llama-index-core>=0.12.0,<1.0.0
+llama-index-readers-file>=0.4.0
+llama-index-embeddings-huggingface>=0.5.0
+llama-index-vector-stores-qdrant>=0.5.0
+llama-index-retrievers-bm25>=0.5.0
+llama-index-graph-stores-neo4j>=0.5.0
+llama-index-llms-ollama>=0.5.0
+
+# ── Vector database ─────────────────────────────────────────
+qdrant-client>=1.12.0,<2.0.0
+
+# ── Embeddings + reranker ───────────────────────────────────
+sentence-transformers>=3.0.0,<4.0.0
+transformers>=4.40.0,<5.0.0
+torch>=2.2.0
+huggingface-hub>=0.23.0,<1.0.0
+
+# ── Sparse retrieval / BM25 ─────────────────────────────────
+rank-bm25>=0.2.2
+
+# ── Graph database ──────────────────────────────────────────
+neo4j>=5.20.0,<6.0.0
+networkx>=3.2.0
+
+# ── PDF extraction ──────────────────────────────────────────
+pypdf>=4.2.0
+pdfplumber>=0.11.0
+
+# ── Local LLM serving ───────────────────────────────────────
+ollama>=0.3.0
+
+# ── Evaluation ──────────────────────────────────────────────
+ragas>=0.2.0
+datasets>=2.20.0
+
+# ── Utilities ───────────────────────────────────────────────
+numpy>=1.26.0,<2.0.0
+pandas>=2.2.0,<3.0.0
+tqdm>=4.66.0
+tenacity>=8.3.0
+loguru>=0.7.0
